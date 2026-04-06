@@ -2,3 +2,4 @@
 validation/
 image.jpg
 ocr_results.json
+eval_results*.json
