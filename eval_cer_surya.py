@@ -1,10 +1,10 @@
 """
-OCR CER 평가 - TrOCR / bbox 크롭 방식
+OCR CER 평가 - Surya / bbox 크롭 방식
 =========================================
 사용법:
-    python eval_cer_trocr.py --input ./validation
-    python eval_cer_trocr.py --label_zip "[라벨]train.zip" --img_zips "[원천]train1.zip" ...
-    python eval_cer_trocr.py --label_zip ... --img_zips ... --max 200
+    python eval_cer_surya.py --input ./validation
+    python eval_cer_surya.py --label_zip "[라벨]validation.zip" --img_zips "[원천]validation.zip"
+    python eval_cer_surya.py --label_zip ... --img_zips ... --stems test1000_stems.json
 """
 
 import io
@@ -12,20 +12,18 @@ import json
 import time
 import argparse
 import zipfile
-import unicodedata
 import numpy as np
 from pathlib import Path, PurePosixPath
 from PIL import Image
 
-import torch
-from transformers import TrOCRProcessor, VisionEncoderDecoderModel
+from surya.recognition import RecognitionPredictor
+from surya.detection import DetectionPredictor
 
 
 # ───────────────────────────────────────────
 # 설정
 # ───────────────────────────────────────────
 
-MODEL_NAME = "team-lucid/trocr-small-korean"
 MIN_BBOX_W = 20
 MIN_BBOX_H = 15
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".tiff"}
@@ -126,7 +124,7 @@ def parse_label_file(path: str) -> list[dict]:
 
 
 # ───────────────────────────────────────────
-# bbox 크롭 → TrOCR
+# bbox 크롭 → Surya OCR
 # ───────────────────────────────────────────
 
 def crop_bbox(img: np.ndarray, bbox: list):
@@ -138,20 +136,25 @@ def crop_bbox(img: np.ndarray, bbox: list):
         return None
     return img[y1:y2, x1:x2]
 
-def ocr_crop(processor, model, device, crop: np.ndarray) -> str:
-    img = Image.fromarray(crop).convert("RGB")
-    pixel_values = processor(img, return_tensors="pt").pixel_values.to(device)
-    with torch.no_grad():
-        generated_ids = model.generate(pixel_values, max_length=64)
-    text = processor.batch_decode(generated_ids, skip_special_tokens=True)[0]
-    return unicodedata.normalize("NFC", text).strip()
+def ocr_crop(rec_predictor, det_predictor, crop: np.ndarray) -> str:
+    try:
+        img = Image.fromarray(crop).convert("RGB")
+        results = rec_predictor([img], [["ko"]], det_predictor)
+        texts = []
+        for res in results:
+            for line in res.text_lines:
+                texts.append(line.text)
+        return " ".join(texts).strip()
+    except Exception as e:
+        print(f"  OCR 에러: {e}")
+        return ""
 
 
 # ───────────────────────────────────────────
 # 평가 루프
 # ───────────────────────────────────────────
 
-def eval_loop(processor, model, device, pairs_iter, total, save_path):
+def eval_loop(rec_predictor, det_predictor, pairs_iter, total, save_path):
     all_results = []
     total_ed, total_gt_len = 0, 0
     skipped = 0
@@ -168,7 +171,7 @@ def eval_loop(processor, model, device, pairs_iter, total, save_path):
         for item in items:
             gt = item["text"]
             crop = crop_bbox(img_np, item["bbox"])
-            pred = ocr_crop(processor, model, device, crop) if crop is not None else ""
+            pred = ocr_crop(rec_predictor, det_predictor, crop) if crop is not None else ""
 
             cer = calc_cer(gt, pred)
             img_ed += edit_distance(gt.strip(), pred.strip())
@@ -208,8 +211,8 @@ def eval_loop(processor, model, device, pairs_iter, total, save_path):
 
     out = {
         "summary": {
-            "engine": "TrOCR",
-            "model": MODEL_NAME,
+            "engine": "Surya",
+            "lang": "korean",
             "total_images": len(all_results),
             "skipped": skipped,
             "global_cer": round(global_cer, 4),
@@ -263,7 +266,7 @@ if __name__ == "__main__":
     parser.add_argument("--img_zips",   type=str, nargs="+")
     parser.add_argument("--max",        type=int, default=None)
     parser.add_argument("--stems",      type=str, default=None)
-    parser.add_argument("--out",        type=str, default="eval_results_trocr.json")
+    parser.add_argument("--out",        type=str, default="eval_results_surya.json")
     args = parser.parse_args()
 
     stem_set = None
@@ -273,11 +276,9 @@ if __name__ == "__main__":
             stem_set = set(_json.load(f))
         print(f"stem 필터: {len(stem_set)}개")
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"TrOCR 모델 로딩 중: {MODEL_NAME} (device={device})")
-    processor = TrOCRProcessor.from_pretrained(MODEL_NAME)
-    model = VisionEncoderDecoderModel.from_pretrained(MODEL_NAME).to(device)
-    model.eval()
+    print("Surya OCR 모델 로딩 중...")
+    rec_predictor = RecognitionPredictor()
+    det_predictor = DetectionPredictor()
     print("로딩 완료")
 
     if args.label_zip:
@@ -286,11 +287,11 @@ if __name__ == "__main__":
             pairs = [p for p in pairs if p[0] in stem_set]
             print(f"필터 후: {len(pairs)}개")
         total = min(len(pairs), args.max) if args.max else len(pairs)
-        eval_loop(processor, model, device, iter_from_zips(pairs, args.max), total, args.out)
+        eval_loop(rec_predictor, det_predictor, iter_from_zips(pairs, args.max), total, args.out)
     elif args.input:
         pairs = gather_pairs_from_dir(Path(args.input))
         print(f"수집된 쌍: {len(pairs)}개")
         total = min(len(pairs), args.max) if args.max else len(pairs)
-        eval_loop(processor, model, device, iter_from_dir(pairs, args.max), total, args.out)
+        eval_loop(rec_predictor, det_predictor, iter_from_dir(pairs, args.max), total, args.out)
     else:
         parser.print_help()

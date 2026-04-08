@@ -261,8 +261,16 @@ if __name__ == "__main__":
     parser.add_argument("--label_zip",  type=str, default=None)
     parser.add_argument("--img_zips",   type=str, nargs="+")
     parser.add_argument("--max",        type=int, default=None)
+    parser.add_argument("--stems",      type=str, default=None)
     parser.add_argument("--out",        type=str, default="eval_results_easyocr.json")
     args = parser.parse_args()
+
+    stem_set = None
+    if args.stems:
+        import json as _json
+        with open(args.stems) as f:
+            stem_set = set(_json.load(f))
+        print(f"stem 필터: {len(stem_set)}개")
 
     print("EasyOCR 초기화 중 (첫 실행 시 모델 다운로드)...")
     reader = easyocr.Reader(["ko"], gpu=True)
@@ -270,6 +278,9 @@ if __name__ == "__main__":
 
     if args.label_zip:
         pairs = gather_pairs_from_zips(args.label_zip, args.img_zips)
+        if stem_set:
+            pairs = [p for p in pairs if p[0] in stem_set]
+            print(f"필터 후: {len(pairs)}개")
         total = min(len(pairs), args.max) if args.max else len(pairs)
         eval_loop(reader, iter_from_zips(pairs, args.max), total, args.out)
     elif args.input:

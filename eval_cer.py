@@ -280,13 +280,24 @@ if __name__ == "__main__":
     parser.add_argument("--img_zips",  type=str, nargs="+",    help="이미지 zip 경로(들)")
     # 공통
     parser.add_argument("--max",       type=int, default=None, help="최대 이미지 수")
+    parser.add_argument("--stems",     type=str, default=None, help="선별된 stem 목록 json")
     parser.add_argument("--out",       type=str, default="eval_results.json")
     parser.add_argument("--check_only",action="store_true",    help="쌍 수집 확인만")
     args = parser.parse_args()
 
+    stem_set = None
+    if args.stems:
+        import json as _json
+        with open(args.stems) as f:
+            stem_set = set(_json.load(f))
+        print(f"stem 필터: {len(stem_set)}개")
+
     if args.label_zip:
         # 분리 zip 모드
         pairs = gather_pairs_from_zips(args.label_zip, args.img_zips)
+        if stem_set:
+            pairs = [p for p in pairs if p[0] in stem_set]
+            print(f"필터 후: {len(pairs)}개")
         if args.check_only:
             print("샘플 10개:")
             for p in pairs[:10]:
