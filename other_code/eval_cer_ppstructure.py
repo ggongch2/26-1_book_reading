@@ -4,10 +4,17 @@ OCR CER 평가 - PPStructureV3 fullpage 방식
 PPStructureV3로 전체 이미지를 파싱하고 Markdown에서 텍스트를 추출.
 GT bbox를 위→아래, 좌→우로 정렬해서 join → 순서 불일치 문제 최소화.
 
+데이터 포맷 (JSON 1개 = bbox 1개):
+    {
+      "source_data_info": {"source_data_name_jpg": "OC2_xxx.jpg"},
+      "learning_data_info": {
+        "plain_text": "인식할 텍스트",
+        "bounding_box": [x, y, w, h]
+      }
+    }
+
 사용법:
-    python eval_cer_ppstructure.py --stems ../test1000_stems.json --max 100
-    python eval_cer_ppstructure.py --label_zip "../validation/[라벨]validation.zip" \
-                                   --img_zips "../validation/[원천]validation.zip"
+    python eval_cer_ppstructure.py --input ~/OCR/1.데이터/Validation --max 100
 """
 
 from __future__ import annotations
@@ -20,6 +27,7 @@ import sys
 import time
 import zipfile
 import argparse
+from collections import defaultdict
 from pathlib import Path, PurePosixPath
 
 import numpy as np
@@ -66,18 +74,54 @@ def calc_cer(gt: str, pred: str) -> float:
 # GT 파싱 - 위→아래, 좌→우 정렬
 # ───────────────────────────────────────────
 
-def parse_gt_text(data: bytes) -> str:
-    obj = json.loads(data.decode("utf-8"))
-    items = []
-    for ann in obj.get("annotations", []):
-        text = ann.get("annotation.text", "").strip()
-        bbox = ann.get("annotation.bbox")
-        if text and bbox and len(bbox) == 4:
-            if int(bbox[2]) < MIN_BBOX_W or int(bbox[3]) < MIN_BBOX_H:
-                continue
-            items.append({"text": text, "bbox": bbox})
-    items.sort(key=lambda x: (x["bbox"][1], x["bbox"][0]))  # y, x 순 정렬
-    return " ".join(item["text"] for item in items)
+def parse_gt_from_json(path: Path) -> dict:
+    """JSON 1개에서 이미지 이름 + 텍스트 + bbox 추출"""
+    obj = json.loads(path.read_text(encoding="utf-8"))
+    img_name = obj.get("source_data_info", {}).get("source_data_name_jpg", "")
+    info = obj.get("learning_data_info", {})
+    text = info.get("plain_text", "").strip()
+    bbox = info.get("bounding_box", [])
+    return {"img_name": img_name, "text": text, "bbox": bbox}
+
+def gather_pairs(input_dir: Path, max_samples: int | None):
+    """디렉토리에서 이미지별로 JSON을 묶어 (img_path, gt_text) 쌍 생성"""
+    img_groups: dict[str, list[dict]] = defaultdict(list)
+    for json_path in sorted(input_dir.rglob("*.json")):
+        try:
+            item = parse_gt_from_json(json_path)
+        except Exception:
+            continue
+        if item["img_name"] and item["text"]:
+            img_groups[item["img_name"]].append(item)
+
+    pairs = []
+    for img_name, items in sorted(img_groups.items()):
+        # 이미지 파일 찾기
+        img_path = input_dir / img_name
+        if not img_path.exists():
+            for ext in IMAGE_EXTS:
+                cand = input_dir / (Path(img_name).stem + ext)
+                if cand.exists():
+                    img_path = cand
+                    break
+        if not img_path.exists():
+            continue
+        # y, x 순 정렬 후 GT 텍스트 합치기
+        items.sort(key=lambda x: (x["bbox"][1] if len(x["bbox"]) >= 2 else 0,
+                                   x["bbox"][0] if len(x["bbox"]) >= 1 else 0))
+        gt_text = " ".join(it["text"] for it in items)
+        pairs.append((img_path, gt_text))
+
+    if max_samples:
+        pairs = pairs[:max_samples]
+    return pairs
+
+def iter_from_dir(input_dir: Path, max_samples: int | None):
+    pairs = gather_pairs(input_dir, max_samples)
+    print(f"평가 대상: {len(pairs)}개")
+    for img_path, gt_text in pairs:
+        img_np = np.array(Image.open(img_path).convert("RGB"))
+        yield img_path.name, gt_text, img_np
 
 
 # ───────────────────────────────────────────
@@ -96,43 +140,6 @@ def ocr_fullpage(pipeline: PPStructureV3, img_np: np.ndarray) -> str:
     return combined.get("markdown_texts", "").strip()
 
 
-# ───────────────────────────────────────────
-# 이터레이터
-# ───────────────────────────────────────────
-
-def iter_from_zips(label_zip: str, img_zips: list[str], stem_set, max_samples):
-    print("zip 인덱싱 중...")
-    with zipfile.ZipFile(label_zip) as z:
-        lbl_map = {PurePosixPath(n).stem: n for n in z.namelist() if n.endswith(".json")}
-    img_map: dict[str, tuple[str, str]] = {}
-    for zip_path in img_zips:
-        with zipfile.ZipFile(zip_path) as z:
-            for n in z.namelist():
-                if PurePosixPath(n).suffix.lower() in IMAGE_EXTS:
-                    img_map[PurePosixPath(n).stem] = (zip_path, n)
-
-    pairs = [(s, lbl_map[s], *img_map[s]) for s in sorted(lbl_map) if s in img_map]
-    if stem_set:
-        pairs = [p for p in pairs if p[0] in stem_set]
-    if max_samples:
-        pairs = pairs[:max_samples]
-    print(f"평가 대상: {len(pairs)}개")
-
-    zip_handles: dict[str, zipfile.ZipFile] = {}
-    try:
-        for stem, lbl_inner, img_zip, img_inner in pairs:
-            if label_zip not in zip_handles:
-                zip_handles[label_zip] = zipfile.ZipFile(label_zip)
-            if img_zip not in zip_handles:
-                zip_handles[img_zip] = zipfile.ZipFile(img_zip)
-            gt_text = parse_gt_text(zip_handles[label_zip].read(lbl_inner))
-            img_np = np.array(
-                Image.open(io.BytesIO(zip_handles[img_zip].read(img_inner))).convert("RGB")
-            )
-            yield stem, gt_text, img_np
-    finally:
-        for z in zip_handles.values():
-            z.close()
 
 
 # ───────────────────────────────────────────
@@ -202,22 +209,13 @@ def eval_loop(pipeline, pairs_iter, total, save_path):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--label_zip", type=str,
-                        default="../validation/[라벨]validation.zip")
-    parser.add_argument("--img_zips",  type=str, nargs="+",
-                        default=["../validation/[원천]validation.zip"])
-    parser.add_argument("--stems",     type=str, default=None)
-    parser.add_argument("--max",       type=int, default=None)
-    parser.add_argument("--device",    type=str, default="gpu:0")
-    parser.add_argument("--out",       type=str,
+    parser.add_argument("--input",  type=str, required=True,
+                        help="JSON + 이미지가 있는 디렉토리 (예: ~/OCR/1.데이터/Validation)")
+    parser.add_argument("--max",    type=int, default=None)
+    parser.add_argument("--device", type=str, default="gpu:0")
+    parser.add_argument("--out",    type=str,
                         default="eval_results_ppstructure_fullpage.json")
     args = parser.parse_args()
-
-    stem_set = None
-    if args.stems:
-        with open(args.stems) as f:
-            stem_set = set(json.load(f))
-        print(f"stem 필터: {len(stem_set)}개")
 
     print("PPStructureV3 로딩 중...")
     pipeline = PPStructureV3(
@@ -233,6 +231,5 @@ if __name__ == "__main__":
     )
     print("로딩 완료")
 
-    total = args.max
-    pairs_iter = iter_from_zips(args.label_zip, args.img_zips, stem_set, args.max)
-    eval_loop(pipeline, pairs_iter, total, args.out)
+    pairs_iter = iter_from_dir(Path(args.input), args.max)
+    eval_loop(pipeline, pairs_iter, args.max, args.out)
