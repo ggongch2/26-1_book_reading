@@ -75,18 +75,25 @@ def calc_cer(gt: str, pred: str) -> float:
 # ───────────────────────────────────────────
 
 def parse_gt_from_json(path: Path) -> dict:
-    """JSON 1개에서 이미지 이름 + 텍스트 + bbox 추출"""
     obj = json.loads(path.read_text(encoding="utf-8"))
-    img_name = obj.get("source_data_info", {}).get("source_data_name_jpg", "")
+    src = obj.get("source_data_info", {})
+    # jpg 없으면 pdf stem으로 찾기
+    img_name = src.get("source_data_name_jpg", "") or src.get("source_data_name_pdf", "")
     info = obj.get("learning_data_info", {})
     text = info.get("plain_text", "").strip()
     bbox = info.get("bounding_box", [])
     return {"img_name": img_name, "text": text, "bbox": bbox}
 
-def gather_pairs(input_dir: Path, max_samples: int | None):
-    """디렉토리에서 이미지별로 JSON을 묶어 (img_path, gt_text) 쌍 생성"""
+def find_source_file(stem: str, source_dir: Path) -> Path | None:
+    """stem에 해당하는 이미지/PDF를 source_dir에서 재귀 검색"""
+    for ext in list(IMAGE_EXTS) + [".pdf"]:
+        for cand in source_dir.rglob(stem + ext):
+            return cand
+    return None
+
+def gather_pairs(label_dir: Path, source_dir: Path, max_samples: int | None):
     img_groups: dict[str, list[dict]] = defaultdict(list)
-    for json_path in sorted(input_dir.rglob("*.json")):
+    for json_path in sorted(label_dir.rglob("*.json")):
         try:
             item = parse_gt_from_json(json_path)
         except Exception:
@@ -96,41 +103,38 @@ def gather_pairs(input_dir: Path, max_samples: int | None):
 
     pairs = []
     for img_name, items in sorted(img_groups.items()):
-        # 이미지 파일 찾기
-        img_path = input_dir / img_name
-        if not img_path.exists():
-            for ext in IMAGE_EXTS:
-                cand = input_dir / (Path(img_name).stem + ext)
-                if cand.exists():
-                    img_path = cand
-                    break
-        if not img_path.exists():
+        stem = Path(img_name).stem
+        src_path = find_source_file(stem, source_dir)
+        if src_path is None:
             continue
-        # y, x 순 정렬 후 GT 텍스트 합치기
         items.sort(key=lambda x: (x["bbox"][1] if len(x["bbox"]) >= 2 else 0,
                                    x["bbox"][0] if len(x["bbox"]) >= 1 else 0))
         gt_text = " ".join(it["text"] for it in items)
-        pairs.append((img_path, gt_text))
+        pairs.append((src_path, gt_text))
 
     if max_samples:
         pairs = pairs[:max_samples]
     return pairs
 
-def iter_from_dir(input_dir: Path, max_samples: int | None):
-    pairs = gather_pairs(input_dir, max_samples)
+def iter_from_dir(label_dir: Path, source_dir: Path, max_samples: int | None):
+    pairs = gather_pairs(label_dir, source_dir, max_samples)
     print(f"평가 대상: {len(pairs)}개")
-    for img_path, gt_text in pairs:
-        img_np = np.array(Image.open(img_path).convert("RGB"))
-        yield img_path.name, gt_text, img_np
+    for src_path, gt_text in pairs:
+        if src_path.suffix.lower() == ".pdf":
+            img_np = None  # PDF는 pipeline에 경로로 직접 넘김
+        else:
+            img_np = np.array(Image.open(src_path).convert("RGB"))
+        yield src_path, gt_text, img_np
 
 
 # ───────────────────────────────────────────
 # PPStructureV3 fullpage OCR
 # ───────────────────────────────────────────
 
-def ocr_fullpage(pipeline: PPStructureV3, img_np: np.ndarray) -> str:
-    img_pil = Image.fromarray(img_np)
-    results = list(pipeline.predict(input=img_pil))
+def ocr_fullpage(pipeline: PPStructureV3, src_path: Path, img_np) -> str:
+    # PDF는 경로로, 이미지는 numpy로 넘김
+    inp = str(src_path) if src_path.suffix.lower() == ".pdf" else img_np
+    results = list(pipeline.predict(input=inp))
     if not results:
         return ""
     if len(results) == 1:
@@ -150,12 +154,12 @@ def eval_loop(pipeline, pairs_iter, total, save_path):
     all_results = []
     total_ed, total_gt_len = 0, 0
 
-    for i, (name, gt_text, img_np) in enumerate(pairs_iter):
+    for i, (src_path, gt_text, img_np) in enumerate(pairs_iter):
         if not gt_text:
             continue
 
         t0 = time.time()
-        pred_text = ocr_fullpage(pipeline, img_np)
+        pred_text = ocr_fullpage(pipeline, src_path, img_np)
         elapsed = time.time() - t0
 
         cer = calc_cer(gt_text, pred_text)
@@ -163,6 +167,7 @@ def eval_loop(pipeline, pairs_iter, total, save_path):
         total_ed += ed
         total_gt_len += len(gt_text.strip())
 
+        name = src_path.name
         total_str = str(total) if total else "?"
         print(f"[{i+1}/{total_str}] {name} | CER: {cer:.4f} | {elapsed:.2f}s")
 
@@ -210,7 +215,9 @@ def eval_loop(pipeline, pairs_iter, total, save_path):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--input",  type=str, required=True,
-                        help="JSON + 이미지가 있는 디렉토리 (예: ~/OCR/1.데이터/Validation)")
+                        help="JSON 라벨 디렉토리 (예: ~/OCR/1.데이터/Validation/02.라벨링데이터)")
+    parser.add_argument("--source", type=str, required=True,
+                        help="PDF/이미지 디렉토리 (예: ~/OCR/1.데이터/Training/01.원천데이터)")
     parser.add_argument("--max",    type=int, default=None)
     parser.add_argument("--device", type=str, default="gpu:0")
     parser.add_argument("--out",    type=str,
@@ -231,5 +238,5 @@ if __name__ == "__main__":
     )
     print("로딩 완료")
 
-    pairs_iter = iter_from_dir(Path(args.input), args.max)
+    pairs_iter = iter_from_dir(Path(args.input), Path(args.source), args.max)
     eval_loop(pipeline, pairs_iter, args.max, args.out)
